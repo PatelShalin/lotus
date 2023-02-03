@@ -25,7 +25,6 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
-	"github.com/filecoin-project/go-paramfetch"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
@@ -36,7 +35,6 @@ import (
 	power6 "github.com/filecoin-project/specs-actors/v6/actors/builtin/power"
 
 	lapi "github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/api/v0api"
 	"github.com/filecoin-project/lotus/api/v1api"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors"
@@ -156,9 +154,9 @@ var initCmd = &cli.Command{
 
 		log.Info("Checking proof parameters")
 
-		if err := paramfetch.GetParams(ctx, build.ParametersJSON(), build.SrsJSON(), uint64(ssize)); err != nil {
-			return xerrors.Errorf("fetching proof parameters: %w", err)
-		}
+		// if err := paramfetch.GetParams(ctx, build.ParametersJSON(), build.SrsJSON(), uint64(ssize)); err != nil {
+		// 	return xerrors.Errorf("fetching proof parameters: %w", err)
+		// }
 
 		log.Info("Trying to connect to full node RPC")
 
@@ -174,11 +172,11 @@ var initCmd = &cli.Command{
 
 		log.Info("Checking full node sync status")
 
-		if !cctx.Bool("genesis-miner") && !cctx.Bool("nosync") {
-			if err := lcli.SyncWait(ctx, &v0api.WrapperV1Full{FullNode: api}, false); err != nil {
-				return xerrors.Errorf("sync wait: %w", err)
-			}
-		}
+		// if !cctx.Bool("genesis-miner") && !cctx.Bool("nosync") {
+		// 	if err := lcli.SyncWait(ctx, &v0api.WrapperV1Full{FullNode: api}, false); err != nil {
+		// 		return xerrors.Errorf("sync wait: %w", err)
+		// 	}
+		// }
 
 		log.Info("Checking if repo exists")
 

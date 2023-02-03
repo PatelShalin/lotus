@@ -2,26 +2,32 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math/big"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/docker/go-units"
+	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/minio/blake2b-simd"
 	"github.com/mitchellh/go-homedir"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
+	ffi "github.com/filecoin-project/filecoin-ffi"
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-paramfetch"
 	"github.com/filecoin-project/go-state-types/abi"
 	prooftypes "github.com/filecoin-project/go-state-types/proof"
+	prf "github.com/filecoin-project/specs-actors/actors/runtime/proof"
 
 	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
@@ -107,6 +113,8 @@ func main() {
 			sealBenchCmd,
 			simpleCmd,
 			importBenchCmd,
+			performSealCmd,
+			performProveCmd,
 		},
 	}
 
@@ -114,6 +122,302 @@ func main() {
 		log.Warnf("%+v", err)
 		return
 	}
+}
+
+var performSealCmd = &cli.Command{
+	Name:  "sealData",
+	Usage: "Seal a file containing data.",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "unsealed-path",
+			Value: "./unsealed_sector",
+			Usage: "path to store the unsealed sector",
+		},
+		&cli.StringFlag{
+			Name:  "sealed-path",
+			Value: "./sealed_sector",
+			Usage: "path to store the sealed sector",
+		},
+		&cli.StringFlag{
+			Name:  "cache-path",
+			Value: "./cache/",
+			Usage: "path to store cache",
+		},
+		&cli.StringFlag{
+			Name:  "json-path",
+			Value: "./c1.json",
+			Usage: "path to store json file for commit1",
+		},
+		&cli.StringFlag{
+			Name:  "sector-size",
+			Value: "512MiB",
+			Usage: "size of the sectors in bytes, i.e. 32GiB",
+		},
+		&cli.IntFlag{
+			Name:  "num-sectors",
+			Usage: "select number of sectors to seal",
+			Value: 1,
+		},
+		&cli.StringFlag{
+			Name:  "miner-addr",
+			Usage: "pass miner address (only necessary if using existing sectorbuilder)",
+			Value: "t01000",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		ctx := cctx.Context
+
+		maddr, err := address.NewFromString(cctx.String("miner-addr"))
+		if err != nil {
+			return err
+		}
+		amid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return err
+		}
+		mid := abi.ActorID(amid)
+
+		sectorSizeInt, err := units.RAMInBytes(cctx.String("sector-size"))
+		if err != nil {
+			return err
+		}
+		sectorSize := abi.SectorSize(sectorSizeInt)
+
+		_, err = exec.Command("truncate", "-s "+cctx.String("sector-size"), cctx.Args().First()).Output()
+		if err != nil {
+			return xerrors.Errorf("truncate file: %w", err)
+		}
+
+		pp := benchSectorProvider{
+			storiface.FTUnsealed: cctx.String("unsealed-path"),
+			storiface.FTSealed:   cctx.String("sealed-path"),
+			storiface.FTCache:    cctx.String("cache-path"),
+		}
+
+		sealer, err := ffiwrapper.New(pp)
+		if err != nil {
+			return err
+		}
+
+		sr := storiface.SectorRef{
+			ID: abi.SectorID{
+				Miner:  mid,
+				Number: 1,
+			},
+			ProofType: spt(sectorSize),
+		}
+
+		data, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return xerrors.Errorf("open data file: %w", err)
+		}
+
+		var start = time.Now()
+
+		pi, err := sealer.AddPiece(ctx, sr, []abi.UnpaddedPieceSize{}, abi.PaddedPieceSize(sectorSize).Unpadded(), data)
+		if err != nil {
+			return xerrors.Errorf("add piece: %w", err)
+		}
+
+		var took = time.Now().Sub(start)
+
+		fmt.Printf("AddPiece %s (%s)\n", took, bps(abi.SectorSize(pi.Size), 1, took))
+
+		// PC1
+
+		start = time.Now()
+
+		var ticket [32]byte // all zero
+
+		piece := []abi.PieceInfo{pi}
+
+		p1o, err := sealer.SealPreCommit1(ctx, sr, ticket[:], piece)
+		if err != nil {
+			return xerrors.Errorf("precommit1: %w", err)
+		}
+
+		took = time.Now().Sub(start)
+
+		fmt.Printf("PreCommit1 %s (%s)\n", took, bps(sectorSize, 1, took))
+
+		// PC2
+
+		start = time.Now()
+
+		p2o, err := sealer.SealPreCommit2(ctx, sr, p1o)
+		if err != nil {
+			return xerrors.Errorf("precommit2: %w", err)
+		}
+
+		commd, commr := p2o.Unsealed, p2o.Sealed
+
+		took = time.Now().Sub(start)
+
+		fmt.Printf("PreCommit2 %s (%s)\n", took, bps(sectorSize, 1, took))
+
+		f, err := os.Create("./commr.txt")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		_, err = f.WriteString(fmt.Sprintf("%s", commr))
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// C1
+
+		start = time.Now()
+
+		var ticketC1, seed [32]byte // all zero
+
+		c1o, err := sealer.SealCommit1(ctx, sr, ticketC1[:], seed[:], []abi.PieceInfo{
+			{
+				Size:     abi.PaddedPieceSize(sectorSize),
+				PieceCID: commd,
+			},
+		}, storiface.SectorCids{
+			Unsealed: commd,
+			Sealed:   commr,
+		})
+		if err != nil {
+			return xerrors.Errorf("commit1: %w", err)
+		}
+
+		took = time.Now().Sub(start)
+
+		fmt.Printf("Commit1 %s (%s)\n", took, bps(sectorSize, 1, took))
+
+		c2in := Commit2In{
+			SectorNum:  int64(1),
+			Phase1Out:  c1o,
+			SectorSize: uint64(sectorSize),
+		}
+
+		// C2
+
+		start = time.Now()
+
+		if err := paramfetch.GetParams(lcli.ReqContext(cctx), build.ParametersJSON(), build.SrsJSON(), c2in.SectorSize); err != nil {
+			return xerrors.Errorf("getting params: %w", err)
+		}
+
+		proof, err := sealer.SealCommit2(context.TODO(), sr, c2in.Phase1Out)
+		if err != nil {
+			return err
+		}
+
+		sealCommit2 := time.Now()
+		dur := sealCommit2.Sub(start)
+
+		fmt.Printf("Commit2: %s (%s)\n", dur, bps(abi.SectorSize(c2in.SectorSize), 1, dur))
+		fmt.Printf("proof: %x\n", proof)
+
+		return nil
+	},
+}
+
+var performProveCmd = &cli.Command{
+	Name:  "windowPost",
+	Usage: "Generate windowPoSt for a sealed sector.",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "sealed-path",
+			Value: "./sealed_sector",
+			Usage: "path to store the sealed sector",
+		},
+		&cli.StringFlag{
+			Name:  "cache-path",
+			Value: "./cache/",
+			Usage: "path to store cache",
+		},
+		&cli.StringFlag{
+			Name:  "commr-path",
+			Value: "./commr.txt",
+			Usage: "path to commr created in sealData",
+		},
+		&cli.StringFlag{
+			Name:  "sector-size",
+			Value: "512MiB",
+			Usage: "size of the sectors in bytes, i.e. 32GiB",
+		},
+		&cli.StringFlag{
+			Name:  "miner-addr",
+			Usage: "pass miner address (only necessary if using existing sectorbuilder)",
+			Value: "t01000",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		maddr, err := address.NewFromString(cctx.String("miner-addr"))
+		if err != nil {
+			return err
+		}
+		amid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return err
+		}
+		mid := abi.ActorID(amid)
+
+		sectorSizeInt, err := units.RAMInBytes(cctx.String("sector-size"))
+		if err != nil {
+			return err
+		}
+		sectorSize := abi.SectorSize(sectorSizeInt)
+
+		var rand [32]byte // all zero
+
+		filebuffer, err := ioutil.ReadFile(cctx.String("commr-path"))
+		commr, err := cid.Parse(string(filebuffer))
+		if err != nil {
+			return xerrors.Errorf("parse commr: %w", err)
+		}
+
+		wpt, err := spt(sectorSize).RegisteredWindowPoStProof()
+		if err != nil {
+			return err
+		}
+
+		snum, err := strconv.ParseUint(cctx.Args().Get(0), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing sector num: %w", err)
+		}
+		sn := abi.SectorNumber(snum)
+
+		ch, err := ffi.GeneratePoStFallbackSectorChallenges(wpt, mid, rand[:], []abi.SectorNumber{sn})
+		if err != nil {
+			return xerrors.Errorf("generating challenges: %w", err)
+		}
+
+		start := time.Now()
+
+		vp, err := ffi.GenerateSingleVanillaProof(ffi.PrivateSectorInfo{
+			SectorInfo: prf.SectorInfo{
+				SealProof:    spt(sectorSize),
+				SectorNumber: sn,
+				SealedCID:    commr,
+			},
+			CacheDirPath:     cctx.String("cache-path"),
+			PoStProofType:    wpt,
+			SealedSectorPath: cctx.String("sealed-path"),
+		}, ch.Challenges[sn])
+		if err != nil {
+			return err
+		}
+
+		challenge := time.Now()
+
+		proof, err := ffi.GenerateSinglePartitionWindowPoStWithVanilla(wpt, mid, rand[:], [][]byte{vp}, 0)
+		if err != nil {
+			return xerrors.Errorf("generate post: %w", err)
+		}
+
+		end := time.Now()
+
+		fmt.Printf("Vanilla %s (%s)\n", challenge.Sub(start), bps(sectorSize, 1, challenge.Sub(start)))
+		fmt.Printf("Proof %s (%s)\n", end.Sub(challenge), bps(sectorSize, 1, end.Sub(challenge)))
+		fmt.Println(base64.StdEncoding.EncodeToString(proof.ProofBytes))
+		return nil
+	},
 }
 
 var sealBenchCmd = &cli.Command{
@@ -468,7 +772,7 @@ var sealBenchCmd = &cli.Command{
 		}
 
 		bo.EnvVar = make(map[string]string)
-		for _, envKey := range []string{"BELLMAN_NO_GPU", "FIL_PROOFS_MAXIMIZE_CACHING", "FIL_PROOFS_USE_GPU_COLUMN_BUILDER",
+		for _, envKey := range []string{"BELLMAN_NO_GPU", "FIL_PROOFS_USE_GPU_COLUMN_BUILDER",
 			"FIL_PROOFS_USE_GPU_TREE_BUILDER", "FIL_PROOFS_USE_MULTICORE_SDR", "BELLMAN_CUSTOM_GPU"} {
 			envValue, found := os.LookupEnv(envKey)
 			if found {
