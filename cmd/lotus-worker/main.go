@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -9,10 +10,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/docker/go-units"
 	"github.com/google/uuid"
+	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore/namespace"
 	logging "github.com/ipfs/go-log/v2"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -21,12 +25,18 @@ import (
 	"go.opencensus.io/tag"
 	"golang.org/x/xerrors"
 
+	ffi "github.com/filecoin-project/filecoin-ffi"
+	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-jsonrpc/auth"
 	"github.com/filecoin-project/go-paramfetch"
 	"github.com/filecoin-project/go-statestore"
+	prf "github.com/filecoin-project/specs-actors/actors/runtime/proof"
 
+	"github.com/filecoin-project/go-state-types/abi"
+	prooftypes "github.com/filecoin-project/go-state-types/proof"
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	lcli "github.com/filecoin-project/lotus/cli"
 	cliutil "github.com/filecoin-project/lotus/cli/util"
 	"github.com/filecoin-project/lotus/cmd/lotus-worker/sealworker"
@@ -62,6 +72,7 @@ func main() {
 		waitQuietCmd,
 		resourcesCmd,
 		tasksCmd,
+		verifyPoSt,
 	}
 
 	app := &cli.App{
@@ -115,6 +126,76 @@ func main() {
 		log.Warnf("%+v", err)
 		return
 	}
+}
+
+var verifyPoSt = &cli.Command{
+	Name:  "verifyPost",
+	Usage: "Verify windowPoSt for a sealed sector.",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "sector-size",
+			Value: "512MiB",
+			Usage: "size of the sectors in bytes, i.e. 32GiB",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		maddr, err := address.NewFromString(cctx.Args().Get(0))
+		if err != nil {
+			return err
+		}
+		amid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return err
+		}
+		mid := abi.ActorID(amid)
+
+		sectorSizeInt, err := units.RAMInBytes(cctx.String("sector-size"))
+		if err != nil {
+			return err
+		}
+		sectorSize := abi.SectorSize(sectorSizeInt)
+
+		snum, err := strconv.ParseUint(cctx.Args().Get(1), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing sector num: %w", err)
+		}
+		sn := abi.SectorNumber(snum)
+
+		commr, err := cid.Parse(cctx.Args().Get(2))
+
+		regproofint, err := strconv.Atoi(cctx.Args().Get(3))
+		regproof := abi.RegisteredPoStProof(regproofint)
+
+		proofbytes, err := base64.StdEncoding.DecodeString(cctx.Args().Get(4))
+
+		si := prf.SectorInfo{
+			SealProof:    spt(sectorSize),
+			SectorNumber: sn,
+			SealedCID:    commr,
+		}
+
+		var rand []byte // all zero
+		randomness := abi.PoStRandomness(rand)
+		postproof := []prooftypes.PoStProof{prooftypes.PoStProof{PoStProof: regproof, ProofBytes: proofbytes}}
+		siArray := []prf.SectorInfo{si}
+		verifyInfo := prooftypes.WindowPoStVerifyInfo{Randomness: randomness, Proofs: postproof, ChallengedSectors: siArray, Prover: mid}
+
+		// log.Info(verifyInfo)
+
+		res, err := ffi.VerifyWindowPoSt(verifyInfo)
+		fmt.Println(res)
+
+		return nil
+	},
+}
+
+func spt(ssize abi.SectorSize) abi.RegisteredSealProof {
+	spt, err := miner.SealProofTypeFromSectorSize(ssize, build.TestNetworkVersion)
+	if err != nil {
+		panic(err)
+	}
+
+	return spt
 }
 
 var stopCmd = &cli.Command{

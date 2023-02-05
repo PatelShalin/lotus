@@ -102,8 +102,6 @@ type Commit2In struct {
 func main() {
 	logging.SetLogLevel("*", "INFO")
 
-	log.Info("Starting lotus-bench")
-
 	app := &cli.App{
 		Name:    "lotus-bench",
 		Usage:   "Benchmark performance of lotus on your hardware",
@@ -364,10 +362,11 @@ var performProveCmd = &cli.Command{
 		}
 		sectorSize := abi.SectorSize(sectorSizeInt)
 
-		var rand [32]byte // all zero
+		var rand []byte // all zero
 
 		filebuffer, err := ioutil.ReadFile(cctx.String("commr-path"))
-		commr, err := cid.Parse(string(filebuffer))
+		commr_str := string(filebuffer)
+		commr, err := cid.Parse(commr_str)
 		if err != nil {
 			return xerrors.Errorf("parse commr: %w", err)
 		}
@@ -388,14 +387,14 @@ var performProveCmd = &cli.Command{
 			return xerrors.Errorf("generating challenges: %w", err)
 		}
 
-		start := time.Now()
+		si := prf.SectorInfo{
+			SealProof:    spt(sectorSize),
+			SectorNumber: sn,
+			SealedCID:    commr,
+		}
 
 		vp, err := ffi.GenerateSingleVanillaProof(ffi.PrivateSectorInfo{
-			SectorInfo: prf.SectorInfo{
-				SealProof:    spt(sectorSize),
-				SectorNumber: sn,
-				SealedCID:    commr,
-			},
+			SectorInfo:       si,
 			CacheDirPath:     cctx.String("cache-path"),
 			PoStProofType:    wpt,
 			SealedSectorPath: cctx.String("sealed-path"),
@@ -404,18 +403,26 @@ var performProveCmd = &cli.Command{
 			return err
 		}
 
-		challenge := time.Now()
-
 		proof, err := ffi.GenerateSinglePartitionWindowPoStWithVanilla(wpt, mid, rand[:], [][]byte{vp}, 0)
 		if err != nil {
 			return xerrors.Errorf("generate post: %w", err)
 		}
 
-		end := time.Now()
-
-		fmt.Printf("Vanilla %s (%s)\n", challenge.Sub(start), bps(sectorSize, 1, challenge.Sub(start)))
-		fmt.Printf("Proof %s (%s)\n", end.Sub(challenge), bps(sectorSize, 1, end.Sub(challenge)))
+		fmt.Println(cctx.String("miner-addr"))
+		fmt.Println(cctx.Args().Get(0))
+		fmt.Println(commr_str)
+		fmt.Println(proof.PoStProof)
 		fmt.Println(base64.StdEncoding.EncodeToString(proof.ProofBytes))
+
+		// randomness := abi.PoStRandomness(rand)
+		// postproof := []prooftypes.PoStProof{prooftypes.PoStProof{PoStProof: proof.PoStProof, ProofBytes: proof.ProofBytes}}
+		// siArray := []prf.SectorInfo{si}
+		// verifyInfo := prooftypes.WindowPoStVerifyInfo{Randomness: randomness, Proofs: postproof, ChallengedSectors: siArray, Prover: mid}
+
+		// log.Info(verifyInfo)
+
+		// test, err := ffi.VerifyWindowPoSt(verifyInfo)
+		// log.Info(test)
 		return nil
 	},
 }
