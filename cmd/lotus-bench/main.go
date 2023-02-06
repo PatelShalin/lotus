@@ -210,20 +210,12 @@ var performSealCmd = &cli.Command{
 			return xerrors.Errorf("open data file: %w", err)
 		}
 
-		var start = time.Now()
-
 		pi, err := sealer.AddPiece(ctx, sr, []abi.UnpaddedPieceSize{}, abi.PaddedPieceSize(sectorSize).Unpadded(), data)
 		if err != nil {
 			return xerrors.Errorf("add piece: %w", err)
 		}
 
-		var took = time.Now().Sub(start)
-
-		fmt.Printf("AddPiece %s (%s)\n", took, bps(abi.SectorSize(pi.Size), 1, took))
-
 		// PC1
-
-		start = time.Now()
 
 		var ticket [32]byte // all zero
 
@@ -234,13 +226,20 @@ var performSealCmd = &cli.Command{
 			return xerrors.Errorf("precommit1: %w", err)
 		}
 
-		took = time.Now().Sub(start)
+		p1odec := map[string]interface{}{}
+		json.Unmarshal(p1o, &p1odec)
 
-		fmt.Printf("PreCommit1 %s (%s)\n", took, bps(sectorSize, 1, took))
+		prooffile, err := os.Create("./sealproof.txt")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		_, err = prooffile.WriteString(fmt.Sprintf("%s\n", p1odec["_lotus_SealRandomness"]))
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		// PC2
-
-		start = time.Now()
 
 		p2o, err := sealer.SealPreCommit2(ctx, sr, p1o)
 		if err != nil {
@@ -248,10 +247,6 @@ var performSealCmd = &cli.Command{
 		}
 
 		commd, commr := p2o.Unsealed, p2o.Sealed
-
-		took = time.Now().Sub(start)
-
-		fmt.Printf("PreCommit2 %s (%s)\n", took, bps(sectorSize, 1, took))
 
 		f, err := os.Create("./commr.txt")
 		if err != nil {
@@ -264,8 +259,6 @@ var performSealCmd = &cli.Command{
 		}
 
 		// C1
-
-		start = time.Now()
 
 		var ticketC1, seed [32]byte // all zero
 
@@ -282,10 +275,6 @@ var performSealCmd = &cli.Command{
 			return xerrors.Errorf("commit1: %w", err)
 		}
 
-		took = time.Now().Sub(start)
-
-		fmt.Printf("Commit1 %s (%s)\n", took, bps(sectorSize, 1, took))
-
 		c2in := Commit2In{
 			SectorNum:  int64(1),
 			Phase1Out:  c1o,
@@ -293,8 +282,6 @@ var performSealCmd = &cli.Command{
 		}
 
 		// C2
-
-		start = time.Now()
 
 		if err := paramfetch.GetParams(lcli.ReqContext(cctx), build.ParametersJSON(), build.SrsJSON(), c2in.SectorSize); err != nil {
 			return xerrors.Errorf("getting params: %w", err)
@@ -305,11 +292,10 @@ var performSealCmd = &cli.Command{
 			return err
 		}
 
-		sealCommit2 := time.Now()
-		dur := sealCommit2.Sub(start)
-
-		fmt.Printf("Commit2: %s (%s)\n", dur, bps(abi.SectorSize(c2in.SectorSize), 1, dur))
-		fmt.Printf("proof: %x\n", proof)
+		_, err = prooffile.WriteString(fmt.Sprintf("%s\n%s\n%s\n", commd, commr, base64.StdEncoding.EncodeToString(proof)))
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		return nil
 	},

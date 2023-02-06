@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -72,6 +73,7 @@ func main() {
 		waitQuietCmd,
 		resourcesCmd,
 		tasksCmd,
+		verifySeal,
 		verifyPoSt,
 	}
 
@@ -126,6 +128,71 @@ func main() {
 		log.Warnf("%+v", err)
 		return
 	}
+}
+
+var verifySeal = &cli.Command{
+	Name:  "verifySeal",
+	Usage: "Verify the seal for a sector.",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "sector-size",
+			Value: "512MiB",
+			Usage: "size of the sectors in bytes, i.e. 32GiB",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		commd, err := cid.Decode(cctx.Args().Get(2))
+		if err != nil {
+			return err
+		}
+
+		commr, err := cid.Decode(cctx.Args().Get(3))
+		if err != nil {
+			return err
+		}
+
+		proof, err := base64.StdEncoding.DecodeString(cctx.Args().Get(4))
+		if err != nil {
+			return fmt.Errorf("failed to decode hex proof input: %w", err)
+		}
+
+		maddr, err := address.NewFromString("t01000")
+		if err != nil {
+			return err
+		}
+
+		mid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return err
+		}
+
+		ticket, err := base64.StdEncoding.DecodeString(cctx.Args().Get(1))
+		proofRand, err := hex.DecodeString("")
+
+		si, err := strconv.Atoi(cctx.Args().Get(0))
+		snum := abi.SectorNumber(si)
+
+		ok, err := ffi.VerifySeal(prooftypes.SealVerifyInfo{
+			SectorID: abi.SectorID{
+				Miner:  abi.ActorID(mid),
+				Number: snum,
+			},
+			SealedCID:             commr,
+			SealProof:             abi.RegisteredSealProof(7),
+			Proof:                 proof,
+			DealIDs:               nil,
+			Randomness:            ticket,
+			InteractiveRandomness: proofRand,
+			UnsealedCID:           commd,
+		})
+		if err != nil {
+			fmt.Println(false)
+			return nil
+		}
+
+		fmt.Println(ok)
+		return nil
+	},
 }
 
 var verifyPoSt = &cli.Command{
